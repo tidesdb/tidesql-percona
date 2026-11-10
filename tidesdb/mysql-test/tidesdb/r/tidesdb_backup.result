@@ -1,0 +1,101 @@
+CALL mtr.add_suppression("\\[TIDESDB\\] backup to .* failed");
+#
+# ============================================
+# TEST 1: Online backup creates a valid copy
+# ============================================
+#
+CREATE TABLE t_backup (
+id INT PRIMARY KEY,
+val VARCHAR(100)
+) ENGINE=TIDESDB;
+INSERT INTO t_backup VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+SELECT * FROM t_backup ORDER BY id;
+id	val
+1	alpha
+2	beta
+3	gamma
+# Taking the backup.  The function answers OK, so a failure fails this statement
+# rather than being left in the error log for someone to find.
+backup
+OK
+# Backup should have created the directory.  file_exists fails the test if it
+# is not there, rather than printing a NO that a recorded result would accept.
+# Insert more data after backup (should NOT appear in backup)
+INSERT INTO t_backup VALUES (4, 'delta'), (5, 'epsilon');
+SELECT COUNT(*) AS rows_after FROM t_backup;
+rows_after
+5
+DROP TABLE t_backup;
+#
+# ============================================
+# TEST 2: The destination must be absent or empty
+# ============================================
+#
+# TidesDB 10.2 refuses to write into a directory that already holds files, so a
+# second backup over the first one is rejected rather than half-overwriting it.
+ERROR HY000: [TIDESDB] backup to 'DESTINATION' refused: the directory is not empty; a backup is written only to an absent or empty path
+# The first backup is still whole -- the refusal happened before anything was written.
+# An empty directory is a valid destination, it is only existing content that is refused.
+backup_into_empty
+OK
+# (succeeded -- the statement would have failed otherwise)
+#
+# ============================================
+# TEST 3: A backup with no destination is refused
+# ============================================
+#
+SELECT tidesdb_backup('');
+ERROR HY000: [TIDESDB] tidesdb_backup() needs a destination path
+# and the wrong argument shape is refused before anything runs
+SELECT tidesdb_backup();
+ERROR HY000: Can't initialize function 'tidesdb_backup'; tidesdb_backup() takes one string argument
+#
+# ============================================
+# TEST 4: Concurrent reads/writes during backup
+# ============================================
+#
+CREATE TABLE t_concurrent (
+id INT PRIMARY KEY,
+data VARCHAR(200)
+) ENGINE=TIDESDB;
+# Inserted 100 rows
+SELECT COUNT(*) AS before_backup FROM t_concurrent;
+before_backup
+100
+backup
+OK
+# Backup completed while table was loaded
+SELECT COUNT(*) AS after_backup FROM t_concurrent;
+after_backup
+100
+INSERT INTO t_concurrent VALUES (101, 'post-backup');
+SELECT COUNT(*) AS with_post_backup FROM t_concurrent;
+with_post_backup
+101
+DROP TABLE t_concurrent;
+#
+# ============================================
+# TEST 5: There is no per-table physical copy
+# ============================================
+#
+# FLUSH TABLES ... FOR EXPORT asks the engine to leave a set of files on
+# disk that can be copied out and read back as one table.  The store is one
+# flat directory with a database-wide manifest and value log, an sstable
+# holds whichever families flushed together, and the newest rows are in a
+# memtable shared by every table -- no subset of that is one table.  The
+# engine does not claim the capability, so the server refuses the statement
+# rather than accepting it and leaving an incomplete copy behind.
+CREATE TABLE t_export (id INT PRIMARY KEY, val VARCHAR(50)) ENGINE=TIDESDB;
+INSERT INTO t_export VALUES (1, 'a'), (2, 'b');
+FLUSH TABLES t_export FOR EXPORT;
+ERROR HY000: Table storage engine for 't_export' doesn't have this option
+# and the table is untouched by the refusal
+SELECT id, val FROM t_export ORDER BY id;
+id	val
+1	a
+2	b
+DROP TABLE t_export;
+#
+# === Cleanup ===
+#
+# Done.

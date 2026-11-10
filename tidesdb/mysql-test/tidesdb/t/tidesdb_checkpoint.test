@@ -1,0 +1,58 @@
+--source ../include/have_tidesdb.inc
+#
+# Checkpoint via tidesdb_checkpoint().
+#
+# A checkpoint is two things in order: a full durability barrier on the live
+# database, then a copy of it written to the given path.  The copy is a real
+# database directory -- a manifest plus the sstables and value log it references
+# -- not a hard-link farm and not an archive, so what this checks is that the
+# directory is there afterwards and has a manifest in it.  Asserting only that
+# the statement returned would pass even if nothing were written.
+#
+
+--echo #
+--echo # TEST 1: A checkpoint writes a directory that looks like a database
+--echo #
+
+CREATE TABLE t_ckpt (id INT PRIMARY KEY, val VARCHAR(100)) ENGINE=TidesDB;
+INSERT INTO t_ckpt VALUES (1, 'before_checkpoint'), (2, 'data_two'), (3, 'data_three');
+
+--let $ckpt_dir=$MYSQLTEST_VARDIR/tmp/tidesdb_checkpoint_test
+--error 0,1
+--force-rmdir $ckpt_dir
+
+--disable_query_log
+--eval SELECT tidesdb_checkpoint('$ckpt_dir') AS checkpoint
+--enable_query_log
+
+--echo # Both of these fail the test outright if the path is missing, rather than
+--echo # printing a NO that a recorded result would happily accept forever.
+--file_exists $ckpt_dir
+--file_exists $ckpt_dir/MANIFEST
+
+
+
+--echo #
+--echo # TEST 2: The live database keeps working after the barrier
+--echo #
+
+INSERT INTO t_ckpt VALUES (4, 'after_checkpoint');
+SELECT * FROM t_ckpt ORDER BY id;
+
+--echo #
+--echo # TEST 3: A checkpoint with no destination is refused
+--echo #
+
+--error ER_UNKNOWN_ERROR
+SELECT tidesdb_checkpoint('');
+
+--echo #
+--echo # Cleanup
+--echo #
+
+DROP TABLE t_ckpt;
+--error 0,1
+--force-rmdir $ckpt_dir
+
+--source ../include/cleanup_tidesdb.inc
+--echo # Done.
