@@ -1,0 +1,252 @@
+---
+title: Installing TideSQL
+description: Building the plugin against a server source tree, loading it, and the one linkage detail that decides whether it loads at all.
+---
+
+# Installing TideSQL
+
+TideSQL is a loadable plugin — `ha_tidesdb.so` on Linux and macOS, `ha_tidesdb.dll` on Windows. It
+links the TidesDB library, so that has to be installed first: the plugin's build looks for
+`libtidesdb` and fails configuration without it.
+
+Everything below names the `.so`. On Windows the file is the `.dll` and the rest reads the same.
+
+## The quick way: install.sh
+
+`install.sh` in the repository root does the whole thing — dependencies, the TidesDB library, a
+Percona Server built with the plugin in it, and an initialised data directory with a `my.cnf` that
+already loads the engine:
+
+```bash
+./install.sh
+```
+
+It detects the platform and installs dependencies through whichever package manager belongs to it:
+`apt`, `dnf` or `pacman` on Linux, Homebrew on macOS, vcpkg on Windows under MSYS2 or Git Bash.
+Then it builds and installs `libtidesdb`, clones Percona Server with its submodules, copies the
+engine into `storage/`, copies the test suites into `mysql-test/suite/`, builds, installs, and
+prints the commands to start the server and run the tests.
+
+With no version named it builds the newest Percona Server 9.7 release. `--percona-version` takes a
+release line, `8.0`, `8.4` or `9.7`, and builds that line's newest release, or an exact tag such as
+`Percona-Server-8.4.11-11`. Percona's lines after 9.7 are not tested and are reached only by naming
+their tag. The server's Boost comes from its own tree on 8.4 and 9.7; 8.0 does not carry one, so
+the script downloads the exact release 8.0 asks for into the build directory once.
+
+The flags worth knowing:
+
+| Flag | What it does |
+|------|--------------|
+| `--tidesdb-version VERSION` | TidesDB release tag; defaults to the release this TideSQL is paired with |
+| `--percona-version VERSION` | Percona Server release line or tag; defaults to the newest 9.7 release |
+| `--tidesdb-prefix DIR`, `--percona-prefix DIR` | Where each is installed |
+| `--build-dir DIR` | Working directory for the build |
+| `--percona-src DIR` | Build against a Percona Server source tree you already have, instead of cloning one |
+| `--jobs N` | Parallel build jobs; auto-detected otherwise |
+| `--skip-deps`, `--skip-tidesdb` | Skip dependency installation, or the library build if it is already installed |
+| `--skip-engines ENGINES` | Comma-separated engines to leave out of the server; `--list-engines` shows what can be skipped |
+| `--rebuild-plugin` | Rebuild only the plugin against an existing server build, for a fast edit-build-test cycle |
+| `--allocator NAME` | Allocator for `libtidesdb`: `system` (default), `jemalloc`, `mimalloc` or `tcmalloc`. See the loading note below |
+| `--pgo` | Three-phase profile-guided build: instrument, train on the test suite, rebuild optimised |
+
+```bash
+./install.sh --percona-version 8.0 --jobs 8
+./install.sh --percona-version Percona-Server-8.4.11-11
+./install.sh --skip-deps --skip-tidesdb        # rebuild against what is already installed
+./install.sh --rebuild-plugin                  # just the plugin, after an edit
+```
+
+`--rebuild-plugin` needs a full run to have happened first; it reuses that build tree rather than
+configuring a new one. It does not rebuild `libtidesdb`, so a changed `--allocator` needs a full run
+to take effect.
+
+`--percona-src` points the build at a Percona Server source tree you already have rather than
+cloning one, and combines with `--rebuild-plugin` to build only the engine against it. The tree has
+to be the same version as the server the plugin will be loaded into. A storage engine records the
+`MYSQL_VERSION_ID` it was compiled against, and the server loads only a plugin whose id matches its
+own exactly -- patch releases included, so a plugin built against 8.4.10 is refused by 8.4.11 with
+`API version for STORAGE ENGINE plugin is too different`. There is no storage-engine ABI across
+server versions to rely on, and none between Percona Server and the MySQL release it is based on
+either, so build the plugin against the Percona tree.
+
+```bash
+./install.sh --rebuild-plugin --skip-deps --skip-tidesdb \
+  --percona-src /path/to/percona-server --percona-prefix /usr/local/mysql
+```
+
+The rest of this page is the manual path, which is what to read if you are building against a server
+tree you already have.
+
+## Building the plugin
+
+The plugin builds as part of a server source tree, using the server's own plugin machinery. Put the
+plugin sources under the tree's `storage/` directory and configure the server as you normally would:
+
+```bash
+# 1. the TidesDB library, installed where the plugin's build can find it
+git clone https://github.com/tidesdb/tidesdb.git
+cmake -S tidesdb -B build-tidesdb -DCMAKE_BUILD_TYPE=Release
+cmake --build build-tidesdb --parallel && sudo cmake --install build-tidesdb
+
+# 2. the server, with the submodules its cmake needs
+git clone --depth 1 --branch Percona-Server-8.4.11-11 --recurse-submodules --shallow-submodules \
+  https://github.com/percona/percona-server.git
+
+# 3. the plugin, inside the server tree
+git clone https://github.com/tidesdb/tidesql-percona.git
+cp -r tidesql-percona/tidesdb percona-server/storage/tidesdb
+
+# 4. the test suites, where the server looks for a suite
+cp -r tidesql-percona/tidesdb/mysql-test/tidesdb     percona-server/mysql-test/suite/tidesdb
+cp -r tidesql-percona/tidesdb/mysql-test/tidesdb_rpl percona-server/mysql-test/suite/tidesdb_rpl
+
+# 5. configure and build the server; the plugin is the `tidesdb` target
+cmake -S percona-server -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_UNIT_TESTS=OFF \
+  -DWITH_PACKAGE_FLAGS=OFF -DWITH_EDITLINE=bundled -DWITH_BOOST=percona-server/extra/boost
+cmake --build build --target tidesdb --parallel
+```
+
+On 8.0 the tree has no `extra/boost`. Replace the `WITH_BOOST` setting with
+`-DDOWNLOAD_BOOST=1 -DWITH_BOOST=/path/to/boost`, and the configure step fetches the exact Boost
+release 8.0 is written against into that directory. `WITH_PACKAGE_FLAGS=OFF` keeps Percona's cmake
+from taking the distribution's packaging flags on Debian and RHEL, which add link time optimization.
+`WITH_EDITLINE=bundled` is the default from 8.4 on; 8.0 otherwise links the system readline and stops
+at configure on a host without its headers.
+
+Step 4 is easy to skip and it is not optional. The server discovers a test suite under
+`mysql-test/suite`, and nowhere else — it does not look inside a storage engine's own directory, so
+the suites shipped in `tidesdb/mysql-test/` are invisible until they are copied. `mtr` then finds
+them by name:
+
+```bash
+cd build/mysql-test
+./mtr --suite=tidesdb --parallel=4
+```
+
+On Windows that needs one more flag. With no `--plugin-dir` the server looks in
+`<basedir>/lib/plugin`, and on a build tree that directory only exists on Unix — the server's own
+`CMakeLists.txt` links it to `plugin_output_directory` under `IF(UNIX AND BUILD_IS_SINGLE_CONFIG)`
+and does nothing otherwise. Visual Studio also writes one directory deeper, under the configuration
+name. So point the server at the plugins, the server's own components included:
+
+```bash
+perl mysql-test-run.pl --suite=tidesdb --parallel=4 \
+  --mysqld=--plugin-dir=C:/path/to/build/plugin_output_directory/RelWithDebInfo
+```
+
+`libtidesdb.dll` and the compression DLLs it links have to be on `PATH` as well, or the plugin
+fails to load with `errno: 126` even though the file is there — on Windows that error means either
+the library or something it depends on could not be found.
+
+That leaves the plugin in the build's plugin output directory. Copy it into the server's
+`plugin_dir`, or point `plugin_dir` at the build output while developing. Visual Studio is a
+multi-configuration generator, so on Windows the file is one level deeper, under the configuration
+name — `plugin_output_directory/RelWithDebInfo/ha_tidesdb.dll`.
+
+The plugin declares itself with the server's `MYSQL_ADD_PLUGIN` macro as `MODULE_ONLY`, so it is
+always a loadable module and never linked into the server binary.
+
+## Loading it
+
+At startup, from `my.cnf`:
+
+```ini
+[mysqld]
+plugin-load-add=ha_tidesdb.so
+```
+
+or into a running server:
+
+```sql
+INSTALL PLUGIN TidesDB SONAME 'ha_tidesdb.so';
+```
+
+Once loaded it appears in `SHOW ENGINES`:
+
+```
+      ENGINE: TidesDB
+     SUPPORT: YES
+     COMMENT: LSM B+tree engine with ACID transactions, MVCC concurrency, secondary, spatial
+              and full-text indexes, and encryption
+TRANSACTIONS: YES
+          XA: YES
+  SAVEPOINTS: YES
+```
+
+`XA` reads `YES` with the binary log enabled and `NO` without it -- see
+[Limitations](/appendix/limitations) for why.
+
+and reports its version through the plugin table and its own status variables:
+
+```sql
+SELECT PLUGIN_VERSION FROM information_schema.PLUGINS WHERE PLUGIN_NAME = 'TidesDB';   -- 2.0
+SHOW STATUS LIKE 'tidesdb_version%';   -- tidesdb_version 2.0.0, tidesdb_version_hex 131072
+```
+
+## The allocator, and why the plugin may fail to load
+
+This is the detail worth reading before the first install, because it decides whether the plugin
+loads at all.
+
+TidesDB can be built against a non-default allocator. `jemalloc`, `mimalloc` and `tcmalloc` place
+their thread-local state in the initial-exec TLS model, which needs its space reserved when the
+program starts. A plugin is loaded late, with `dlopen`, well after startup, so when `libtidesdb.so`
+is linked against one of those the loader has no room left to reserve and the plugin does not load:
+
+```
+[ERROR] [MY-010901] [Server] Can't open shared library 'ha_tidesdb.so'
+    (errno: 0 /lib/x86_64-linux-gnu/libjemalloc.so.2: cannot allocate memory in static TLS block).
+[ERROR] [MY-010736] [Server] Couldn't load plugin named 'ha_tidesdb.so' with soname 'ha_tidesdb.so'.
+```
+
+Every statement then fails with `ERROR 1286 (42000): Unknown storage engine 'TidesDB'`, which is the
+symptom you are likely to see first.
+
+The fix is to put the allocator in the process image at startup, so its TLS is reserved up front:
+
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 mysqld --defaults-file=/etc/my.cnf
+```
+
+Under systemd, set it in the unit rather than the shell:
+
+```ini
+[Service]
+Environment=LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2
+```
+
+A library built with the default system allocator has no such requirement and loads with no
+preload. Check what a given build linked against with:
+
+```bash
+ldd /usr/local/lib/libtidesdb.so | grep -E 'jemalloc|mimalloc|tcmalloc'
+```
+
+This is a property of how the library was built, not of the plugin, so rebuilding the plugin alone
+does not change it.
+
+### When the allocator cannot be preloaded
+
+Preloading is the right fix for a server you start yourself, but it is not always available. Running
+the test suite under a sanitizer is the case that matters: the sanitizer runtime takes the same
+initial-exec space the allocator wants, and preloading the allocator alongside it does not help,
+because a sanitizer interposes on the allocator it is trying to measure. The plugin then fails to
+load for the same reason as above, with the suite reporting every test as an unknown storage engine.
+
+Where that happens, enlarge the loader's surplus instead of reserving the allocator early:
+
+```bash
+GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 \
+  ./mtr --suite=tidesdb,tidesdb_rpl
+```
+
+This asks the dynamic loader for more static TLS than it reserves by default, which leaves room for
+a late `dlopen` to claim some. It needs glibc 2.32 or newer, and it is a run-time setting, so it
+changes nothing about how either the library or the plugin was built. A library built with the
+default system allocator needs none of this.
+
+## Where the data lives
+
+TidesDB data files live in a directory of their own rather than among the server's tablespaces,
+`tidesdb_data` beside the server's data directory by default. `tidesdb_data_home_dir` sets it
+explicitly at startup. See [System Variables](/reference/system-variables).

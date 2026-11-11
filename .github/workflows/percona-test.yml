@@ -1,0 +1,360 @@
+name: Percona Server TideSQL Storage Engine Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+# Pinned build versions, the single place to move from one release to the next.
+# TIDESDB_REF is a ref on tidesdb/tidesdb; the Percona Server releases are the
+# matrix below, one tag on percona/percona-server per supported line.
+#
+# TIDESDB_REF is the tag this TideSQL pairs with, so a run is reproducible from
+# the ref alone.  It matches the pin in install.sh and the pairing recorded in
+# VERSIONING.md; move all three together.  Each job still prints the commit the
+# ref resolved to.
+env:
+  TIDESDB_REF: "v10.2.1"
+
+jobs:
+  test:
+    name: ${{ matrix.percona }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Percona Server builds and ships for Linux only, so each line is tested
+        # there.  The tags match the fallbacks in install.sh and the table in
+        # doc/06-appendix/compatibility.md.
+        percona:
+          - Percona-Server-8.0.46-37
+          - Percona-Server-8.4.11-11
+          - Percona-Server-9.7.2-2
+
+    steps:
+      - name: Checkout TideSQL
+        uses: actions/checkout@v4
+        with:
+          path: tidesql
+
+      # The same set install.sh installs on Debian, less the allocators: the
+      # server's RPC, LDAP, SASL, Kerberos and AIO pieces all fail its configure
+      # when their headers are missing.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build git bison ccache pkg-config \
+            libssl-dev libncurses-dev libudev-dev libcurl4-openssl-dev libtirpc-dev \
+            libaio-dev libldap2-dev libsasl2-dev libkrb5-dev \
+            liblz4-dev libzstd-dev libsnappy-dev
+
+      - name: Configure ccache
+        run: |
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache --set-config=max_size=2G
+          ccache --zero-stats
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.percona }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.percona }}-
+
+      # 8.0 carries no Boost of its own and downloads the exact release it names;
+      # caching it spares every run that download.  The later lines ship Boost in
+      # extra/boost and never touch this directory.
+      - name: Cache Boost (8.0)
+        if: startsWith(matrix.percona, 'Percona-Server-8.0.')
+        uses: actions/cache@v4
+        with:
+          path: boost
+          key: boost-${{ matrix.percona }}
+
+      - name: Cache the TidesDB library build
+        id: tidesdb-cache
+        uses: actions/cache@v4
+        with:
+          path: tidesdb-install
+          key: tidesdb-ubuntu-${{ env.TIDESDB_REF }}-${{ github.run_id }}
+
+      - name: Build and install the TidesDB library
+        run: |
+          set -euo pipefail
+          # The plugin links libtidesdb and its build skips itself entirely when it
+          # cannot find it, so this has to succeed before the server is configured.
+          #
+          # Every allocator option defaults to OFF, so this links the system
+          # allocator and the plugin needs no LD_PRELOAD to load.  A build that
+          # turns jemalloc/mimalloc/tcmalloc on would -- see
+          # doc/01-getting-started/install.md.  Nothing here runs the library's own
+          # tests, so they are not built.
+          if [ ! -d tidesdb-install ]; then
+            git clone --depth 1 --branch "${TIDESDB_REF}" \
+              https://github.com/tidesdb/tidesdb.git tidesdb-src
+            # record what the ref resolved to, so a failing run can be tied back to
+            # a commit even though the ref itself may move
+            git -C tidesdb-src rev-parse HEAD
+            cmake -S tidesdb-src -B tidesdb-build -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="$PWD/tidesdb-install" -DTIDESDB_BUILD_TESTS=OFF
+            cmake --build tidesdb-build --parallel
+            cmake --install tidesdb-build
+          fi
+          echo "TIDESDB_ROOT=$PWD/tidesdb-install" >> "$GITHUB_ENV"
+
+      # The coredumper and the KMIP keyring library are submodules the server's
+      # cmake needs even with MyRocks left out, so the clone recurses.
+      - name: Clone Percona Server
+        env:
+          PERCONA_TAG: ${{ matrix.percona }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            if git clone --depth 1 --branch "$PERCONA_TAG" \
+                 --recurse-submodules --shallow-submodules \
+                 https://github.com/percona/percona-server.git percona-server; then
+              exit 0
+            fi
+            echo "clone attempt $i failed, retrying in 10s"
+            rm -rf percona-server
+            sleep 10
+          done
+          echo "could not clone percona-server at $PERCONA_TAG"
+          exit 1
+
+      - name: Copy the storage engine into the server tree
+        run: cp -R tidesql/tidesdb percona-server/storage/tidesdb
+
+      # mtr resolves a suite name only against mysql-test/suite,
+      # plugin/<suite>/tests and a few internal/ paths -- it does not search
+      # storage/<engine>/mysql-test.  Left out, the build is green and nothing is
+      # tested, so both suites are placed where mtr looks and the copy is checked.
+      - name: Install the test suites where mtr looks for them
+        run: |
+          set -euo pipefail
+          src=tidesql/tidesdb/mysql-test
+          dst=percona-server/mysql-test/suite
+          mkdir -p "$dst"
+          for suite in tidesdb tidesdb_rpl; do
+            rm -rf "$dst/$suite"
+            cp -R "$src/$suite" "$dst/$suite"
+          done
+          echo "tidesdb: $(ls "$dst"/tidesdb/t/*.test | wc -l) tests"
+          echo "tidesdb_rpl: $(ls "$dst"/tidesdb_rpl/t/*.test | wc -l) tests"
+
+      # Anything not built is time not spent.  MyRocks and Router are not what any
+      # TideSQL test uses.  WITH_PACKAGE_FLAGS=OFF keeps the distribution's
+      # packaging flags, link time optimization among them, out of the build.
+      # 8.0 links the system readline by default, which the runner does not
+      # have; the bundled editline is what 8.4 and later use anyway.
+      - name: Configure and build the server
+        run: |
+          set -euo pipefail
+          if [ -d percona-server/extra/boost ]; then
+            BOOST="-DWITH_BOOST=$PWD/percona-server/extra/boost"
+          else
+            BOOST="-DDOWNLOAD_BOOST=1 -DWITH_BOOST=$PWD/boost"
+          fi
+          cmake -S percona-server -B percona-server/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            $BOOST \
+            -DWITH_UNIT_TESTS=OFF \
+            -DWITH_PACKAGE_FLAGS=OFF \
+            -DWITH_EDITLINE=bundled \
+            -DWITH_ROCKSDB=OFF \
+            -DWITH_ROUTER=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build percona-server/build --parallel 2>&1 | tee build.log
+
+      # The plugin's own CMake returns early with only a STATUS message when it
+      # cannot find libtidesdb, which would otherwise leave a green build with no
+      # engine in it.
+      - name: Check the plugin was actually built
+        run: |
+          set -euo pipefail
+          found=$(find percona-server/build -name 'ha_tidesdb.so' | head -1)
+          if [ -z "$found" ]; then
+            echo "ha_tidesdb was not built -- the plugin's CMake most likely did not find libtidesdb"
+            grep -i "TidesDB:" build.log | head -20 || true
+            exit 1
+          fi
+          echo "built: $found"
+
+      # RULES.md rule 8 is zero warnings, for this plugin rather than for the whole
+      # server, so the filter keeps only diagnostics whose path is in the engine.
+      - name: Zero-warning gate
+        run: |
+          set -euo pipefail
+          warnings=$(grep -i 'warning' build.log | grep 'storage/tidesdb/' || true)
+          if [ -n "$warnings" ]; then
+            echo "plugin build is not warning-clean:"
+            echo "$warnings"
+            exit 1
+          fi
+          echo "no warnings from storage/tidesdb"
+
+      - name: Run the TideSQL test suite
+        working-directory: percona-server/build/mysql-test
+        run: ./mtr --suite=tidesdb,tidesdb_rpl --parallel=4 --force --retry=1 2>&1 | tee ../../../mtr.log
+
+      # mtr reports success for an empty run, so a suite it failed to find would
+      # otherwise pass.  The floor is deliberately loose: it catches "nothing ran",
+      # not a single removed test.
+      - name: Check the suite actually ran
+        run: |
+          set -euo pipefail
+          line=$(grep -E 'Completed: All [0-9]+ tests were successful' mtr.log | tail -1 || true)
+          if [ -z "$line" ]; then
+            echo "no success line in the mtr output"
+            exit 1
+          fi
+          n=$(echo "$line" | grep -oE '[0-9]+' | head -1)
+          echo "$n tests passed"
+          if [ "$n" -lt 50 ]; then
+            echo "only $n tests ran; a suite was not picked up in full"
+            exit 1
+          fi
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.percona }}
+          path: |
+            build.log
+            mtr.log
+            percona-server/build/mysql-test/var/log/**/*.err
+            percona-server/build/mysql-test/var/log/**/*.reject
+          retention-days: 7
+          if-no-files-found: ignore
+
+  sanitizers:
+    name: ASAN + UBSAN (${{ matrix.percona }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The newest line, where the server's storage-engine interface is widest.
+        percona: [ Percona-Server-9.7.2-2 ]
+    steps:
+      - name: Checkout TideSQL
+        uses: actions/checkout@v4
+        with:
+          path: tidesql
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build git bison ccache pkg-config \
+            libssl-dev libncurses-dev libudev-dev libcurl4-openssl-dev libtirpc-dev \
+            libaio-dev libldap2-dev libsasl2-dev libkrb5-dev \
+            liblz4-dev libzstd-dev libsnappy-dev
+
+      - name: Configure ccache
+        run: |
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache --set-config=max_size=2G
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-asan-${{ matrix.percona }}-${{ github.sha }}
+          restore-keys: |
+            ccache-asan-${{ matrix.percona }}-
+
+      - name: Build and install the TidesDB library
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${TIDESDB_REF}" \
+            https://github.com/tidesdb/tidesdb.git tidesdb-src
+          git -C tidesdb-src rev-parse HEAD
+          cmake -S tidesdb-src -B tidesdb-build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX=/usr/local -DTIDESDB_BUILD_TESTS=OFF
+          cmake --build tidesdb-build --parallel
+          sudo cmake --install tidesdb-build
+          sudo ldconfig
+
+      - name: Clone Percona Server
+        env:
+          PERCONA_TAG: ${{ matrix.percona }}
+        run: |
+          git clone --depth 1 --branch "$PERCONA_TAG" \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/percona/percona-server.git percona-server
+
+      - name: Copy the storage engine and the suite into the server tree
+        run: |
+          set -euo pipefail
+          cp -R tidesql/tidesdb percona-server/storage/tidesdb
+          for suite in tidesdb tidesdb_rpl; do
+            cp -R "tidesql/tidesdb/mysql-test/$suite" "percona-server/mysql-test/suite/$suite"
+          done
+
+      # Only the plugin is instrumented; the server around it is not.  That is the
+      # supported shape -- the sanitizer runtimes are preloaded so the plugin's
+      # undefined __asan_*/__ubsan_* symbols resolve at dlopen, which is also what
+      # proves the instrumentation is live: without the preload the plugin cannot
+      # load at all and every test fails on have_tidesdb.inc.
+      - name: Build the server with an instrumented plugin
+        run: |
+          set -euo pipefail
+          cmake -S percona-server -B percona-server/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DWITH_BOOST="$PWD/percona-server/extra/boost" \
+            -DWITH_UNIT_TESTS=OFF \
+            -DWITH_PACKAGE_FLAGS=OFF \
+            -DWITH_EDITLINE=bundled \
+            -DWITH_ROCKSDB=OFF \
+            -DWITH_ROUTER=OFF \
+            -DTIDESDB_WITH_ASAN=ON -DTIDESDB_WITH_UBSAN=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build percona-server/build --parallel 2>&1 | tee build.log
+          # the instrumentation has to actually be in the object, not just requested
+          nm -D percona-server/build/plugin_output_directory/ha_tidesdb.so \
+            | grep -c "__asan" \
+            || { echo "plugin carries no ASAN symbols; it was not instrumented"; exit 1; }
+
+      - name: Run the suite under the sanitizers
+        working-directory: percona-server/build/mysql-test
+        run: |
+          set -euo pipefail
+          export LD_PRELOAD="$(gcc -print-file-name=libasan.so) $(gcc -print-file-name=libubsan.so)"
+          # The server itself is uninstrumented, so its allocations would dominate a
+          # leak report; the interest here is the plugin's own memory errors.
+          export ASAN_OPTIONS=detect_leaks=0:abort_on_error=0:halt_on_error=0:detect_odr_violation=0
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0
+          ./mtr --suite=tidesdb,tidesdb_rpl --parallel=2 --force --retry=0 2>&1 | tee ../../../mtr.log
+
+      - name: Fail on any sanitizer report
+        run: |
+          set -euo pipefail
+          pattern='ERROR: AddressSanitizer|runtime error:|SUMMARY: (Address|Undefined)'
+          hits=$( { grep -hEc "$pattern" mtr.log || true; } )
+          logs=$( { grep -rhE "$pattern" percona-server/build/mysql-test/var/*/log/*.err 2>/dev/null || true; } )
+          if [ "${hits:-0}" -ne 0 ] || [ -n "$logs" ]; then
+            echo "sanitizer reports:"
+            grep -hE "$pattern" mtr.log | head -40 || true
+            echo "$logs" | head -40
+            exit 1
+          fi
+          echo "clean: no ASAN or UBSAN reports"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sanitizers
+          path: |
+            build.log
+            mtr.log
+            percona-server/build/mysql-test/var/log/**/*.err
+          retention-days: 7
+          if-no-files-found: ignore

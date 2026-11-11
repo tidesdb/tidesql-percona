@@ -1,0 +1,29 @@
+#
+# TEST 1: A checkpoint writes a directory that looks like a database
+#
+CREATE TABLE t_ckpt (id INT PRIMARY KEY, val VARCHAR(100)) ENGINE=TidesDB;
+INSERT INTO t_ckpt VALUES (1, 'before_checkpoint'), (2, 'data_two'), (3, 'data_three');
+checkpoint
+OK
+# Both of these fail the test outright if the path is missing, rather than
+# printing a NO that a recorded result would happily accept forever.
+#
+# TEST 2: The live database keeps working after the barrier
+#
+INSERT INTO t_ckpt VALUES (4, 'after_checkpoint');
+SELECT * FROM t_ckpt ORDER BY id;
+id	val
+1	before_checkpoint
+2	data_two
+3	data_three
+4	after_checkpoint
+#
+# TEST 3: A checkpoint with no destination is refused
+#
+SELECT tidesdb_checkpoint('');
+ERROR HY000: [TIDESDB] tidesdb_checkpoint() needs a destination path
+#
+# Cleanup
+#
+DROP TABLE t_ckpt;
+# Done.

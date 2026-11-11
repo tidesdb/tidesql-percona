@@ -1,0 +1,110 @@
+--source ../include/have_tidesdb_vector.inc
+--source ../include/have_tidesdb.inc
+#
+# Test: VECTOR columns in a TidesDB table.
+#
+# The engine has no vector code.  VECTOR is a blob type -- Field_vector derives
+# from Field_blob and carries its BLOB_FLAG -- so a vector reaches the row codec
+# as bytes and is handled by the same path as BLOB and TEXT.  Support is
+# inherited rather than written, which is exactly why it is worth testing: a
+# change to the blob path, or to how the server models the type, would break it
+# silently and nothing else here would notice.
+#
+# So what follows is a blob round-trip in vector clothing: the value has to come
+# back byte for byte through inserts, updates, deletes and a restart, has to be
+# reachable through a secondary index on another column, and has to keep its
+# dimension.  A vector that came back wrong shows up as a changed dimension or a
+# changed text form.
+#
+# Percona Server 9.7 has a DISTANCE function the server evaluates itself, and
+# no vector index for any engine.  The last sections pin both: a
+# nearest-neighbour query works as a full scan the server ranks, and a vector
+# index does not parse.  A release that adds one fails here, which is the point.
+#
+
+--echo #
+--echo # Setup
+--echo #
+
+CREATE TABLE docs (
+  id    INT NOT NULL PRIMARY KEY,
+  title VARCHAR(100),
+  v     VECTOR(4) NOT NULL,
+  KEY title_idx (title)
+) ENGINE=TidesDB;
+
+INSERT INTO docs VALUES (1, 'origin-x', STRING_TO_VECTOR('[1.0, 0.0, 0.0, 0.0]'));
+INSERT INTO docs VALUES (2, 'origin-y', STRING_TO_VECTOR('[0.0, 1.0, 0.0, 0.0]'));
+INSERT INTO docs VALUES (3, 'origin-z', STRING_TO_VECTOR('[0.0, 0.0, 1.0, 0.4]'));
+INSERT INTO docs VALUES (4, 'near-x',   STRING_TO_VECTOR('[0.9, 0.1, 0.0, 0.0]'));
+INSERT INTO docs VALUES (5, 'center',   STRING_TO_VECTOR('[0.5, 0.5, 0.5, 0.5]'));
+
+--echo #
+--echo # TEST 1: every vector reads back as it was written
+--echo #
+SELECT id, title, VECTOR_TO_STRING(v) AS v FROM docs ORDER BY id;
+SELECT id, VECTOR_DIM(v) AS dims FROM docs ORDER BY id;
+
+--echo #
+--echo # TEST 2: a vector reached through a secondary index on another column
+--echo #
+SELECT id, VECTOR_TO_STRING(v) AS v FROM docs WHERE title = 'near-x';
+
+--echo #
+--echo # TEST 3: UPDATE the vector column
+--echo #
+UPDATE docs SET v = STRING_TO_VECTOR('[0.0, 0.0, 0.0, 1.0]') WHERE id = 5;
+SELECT id, title, VECTOR_TO_STRING(v) AS v FROM docs WHERE id = 5;
+
+--echo #
+--echo # TEST 4: UPDATE a non-vector column leaves the vector alone
+--echo #
+UPDATE docs SET title = 'renamed' WHERE id = 4;
+SELECT id, title, VECTOR_TO_STRING(v) AS v FROM docs WHERE id = 4;
+
+--echo #
+--echo # TEST 5: DELETE a row with a vector
+--echo #
+DELETE FROM docs WHERE id = 2;
+SELECT id, title, VECTOR_TO_STRING(v) AS v FROM docs ORDER BY id;
+
+--echo #
+--echo # TEST 6: the vectors survive a restart
+--echo #
+--source include/restart_mysqld.inc
+SELECT id, title, VECTOR_TO_STRING(v) AS v FROM docs ORDER BY id;
+
+--echo #
+--echo # TEST 7: a vector that does not match the column's dimension is refused
+--echo #
+--error ER_DATA_TOO_LONG
+INSERT INTO docs VALUES (6, 'too-wide', STRING_TO_VECTOR('[1.0, 2.0, 3.0, 4.0, 5.0]'));
+
+--echo #
+--echo # TEST 8: a nearest-neighbour query, ranked by the server over a full scan
+--echo #
+SELECT id, title FROM docs
+  ORDER BY DISTANCE(v, STRING_TO_VECTOR('[1.0, 0.0, 0.0, 0.0]'), 'EUCLIDEAN'), id LIMIT 2;
+
+DROP TABLE docs;
+
+--echo #
+--echo # No index over a vector
+--echo #
+--echo # The server has no vector index syntax, and every ordinary spelling is
+--echo # refused: a vector is not a scalar the server can order.  If either stops
+--echo # being true, this fails and the vector-columns chapter needs revisiting.
+--error ER_PARSE_ERROR
+CREATE TABLE vidx (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, VECTOR INDEX (v)) ENGINE=TidesDB;
+
+--error ER_NON_SCALAR_USED_AS_KEY
+CREATE TABLE vidx (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, KEY (v)) ENGINE=TidesDB;
+
+--error ER_NON_SCALAR_USED_AS_KEY
+CREATE TABLE vidx (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, FULLTEXT KEY (v)) ENGINE=TidesDB;
+
+--error ER_NON_SCALAR_USED_AS_KEY
+CREATE TABLE vidx (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, SPATIAL KEY (v)) ENGINE=TidesDB;
+
+--source ../include/cleanup_tidesdb.inc
+--echo # Done.
