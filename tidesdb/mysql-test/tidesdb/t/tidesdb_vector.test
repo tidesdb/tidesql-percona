@@ -16,12 +16,10 @@
 # dimension.  A vector that came back wrong shows up as a changed dimension or a
 # changed text form.
 #
-# Percona Server 9.7 adds a vector index that an engine opts into, and a
-# DISTANCE function the server evaluates itself.  The engine does not opt in, so
-# the last sections pin both halves: a nearest-neighbour query works as a full
-# scan the server ranks, and a vector index on a TidesDB table is refused by the
-# server before the engine is asked.  An engine that starts offering the index
-# fails here, which is the point.
+# Percona Server 9.7 has a DISTANCE function the server evaluates itself, and
+# no vector index for any engine.  The last sections pin both: a
+# nearest-neighbour query works as a full scan the server ranks, and a vector
+# index does not parse.  A release that adds one fails here, which is the point.
 #
 
 --echo #
@@ -93,13 +91,11 @@ DROP TABLE docs;
 --echo #
 --echo # No index over a vector
 --echo #
---echo # The server's vector index is offered only by an engine that declares it,
---echo # and this one does not, so it is refused before the engine sees the table.
---echo # Every ordinary spelling is refused too: a vector is not a scalar the server
---echo # can order.  If either stops being true, this fails and the vector-columns
---echo # chapter needs revisiting.
---error ER_TABLE_CANT_HANDLE_INDEX
-CREATE TABLE vidx (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, VECTOR KEY vk (v) TYPE hnsw) ENGINE=TidesDB;
+--echo # The server has no vector index syntax, and every ordinary spelling is
+--echo # refused: a vector is not a scalar the server can order.  If either stops
+--echo # being true, this fails and the vector-columns chapter needs revisiting.
+--error ER_PARSE_ERROR
+CREATE TABLE vidx (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, VECTOR INDEX (v)) ENGINE=TidesDB;
 
 --error ER_NON_SCALAR_USED_AS_KEY
 CREATE TABLE vidx (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, KEY (v)) ENGINE=TidesDB;

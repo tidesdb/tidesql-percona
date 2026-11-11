@@ -149,6 +149,8 @@ jobs:
       # Anything not built is time not spent.  MyRocks and Router are not what any
       # TideSQL test uses.  WITH_PACKAGE_FLAGS=OFF keeps the distribution's
       # packaging flags, link time optimization among them, out of the build.
+      # 8.0 links the system readline by default, which the runner does not
+      # have; the bundled editline is what 8.4 and later use anyway.
       - name: Configure and build the server
         run: |
           set -euo pipefail
@@ -162,6 +164,7 @@ jobs:
             $BOOST \
             -DWITH_UNIT_TESTS=OFF \
             -DWITH_PACKAGE_FLAGS=OFF \
+            -DWITH_EDITLINE=bundled \
             -DWITH_ROCKSDB=OFF \
             -DWITH_ROUTER=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -307,6 +310,7 @@ jobs:
             -DWITH_BOOST="$PWD/percona-server/extra/boost" \
             -DWITH_UNIT_TESTS=OFF \
             -DWITH_PACKAGE_FLAGS=OFF \
+            -DWITH_EDITLINE=bundled \
             -DWITH_ROCKSDB=OFF \
             -DWITH_ROUTER=OFF \
             -DTIDESDB_WITH_ASAN=ON -DTIDESDB_WITH_UBSAN=ON \

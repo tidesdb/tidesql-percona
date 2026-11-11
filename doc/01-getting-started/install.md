@@ -102,7 +102,7 @@ cp -r tidesql-percona/tidesdb/mysql-test/tidesdb_rpl percona-server/mysql-test/s
 
 # 5. configure and build the server; the plugin is the `tidesdb` target
 cmake -S percona-server -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_UNIT_TESTS=OFF \
-  -DWITH_PACKAGE_FLAGS=OFF -DWITH_BOOST=percona-server/extra/boost
+  -DWITH_PACKAGE_FLAGS=OFF -DWITH_EDITLINE=bundled -DWITH_BOOST=percona-server/extra/boost
 cmake --build build --target tidesdb --parallel
 ```
 
@@ -110,6 +110,8 @@ On 8.0 the tree has no `extra/boost`. Replace the `WITH_BOOST` setting with
 `-DDOWNLOAD_BOOST=1 -DWITH_BOOST=/path/to/boost`, and the configure step fetches the exact Boost
 release 8.0 is written against into that directory. `WITH_PACKAGE_FLAGS=OFF` keeps Percona's cmake
 from taking the distribution's packaging flags on Debian and RHEL, which add link time optimization.
+`WITH_EDITLINE=bundled` is the default from 8.4 on; 8.0 otherwise links the system readline and stops
+at configure on a host without its headers.
 
 Step 4 is easy to skip and it is not optional. The server discovers a test suite under
 `mysql-test/suite`, and nowhere else — it does not look inside a storage engine's own directory, so

@@ -42,9 +42,8 @@ see [Table Options](/reference/table-options) for the threshold and how to opt a
 
 ## Similarity search is a full scan
 
-Percona Server 9.7 has both halves of a nearest-neighbour search, and TideSQL takes part in one of
-them. The distance function is the server's own and works on any column it can read, so a
-similarity query over a TidesDB table runs, ranked by the server over a full scan:
+The distance function is the server's own and works on any column it can read, so a similarity
+query over a TidesDB table runs, ranked by the server over a full scan:
 
 ```sql
 SELECT id, title FROM embeddings
@@ -54,24 +53,20 @@ SELECT id, title FROM embeddings
 `VECTOR_DISTANCE` is the same function. Every row is read and measured, so the cost grows with the
 table; that is fine for thousands of rows and the wrong tool for millions.
 
-The other half is the index that would make the query approximate and fast. Percona builds it as an
-engine feature: an engine declares that it can hold a vector index, checks the index's parameters,
-and serves the approximate read path itself. InnoDB does all three with an HNSW graph. TideSQL
-declares none of it, so the server refuses the index before the engine is asked:
+There is no index that would make the query approximate and fast. Percona Server 9.7.2 has no vector
+index for any engine, InnoDB included, so the syntax does not parse:
 
 ```sql
-CREATE TABLE t (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, VECTOR KEY vk (v) TYPE hnsw)
-  ENGINE=TIDESDB;
--- ERROR 7035 (HY000): The used table type doesn't support vector indexes
+CREATE TABLE t (id INT PRIMARY KEY, v VECTOR(4) NOT NULL, VECTOR INDEX (v)) ENGINE=TIDESDB;
+-- ERROR 1064 (42000): You have an error in your SQL syntax; ...
 ```
 
 Any other index on the column is refused too, whichever spelling is used — `KEY (v)`,
 `FULLTEXT KEY (v)` and `SPATIAL KEY (v)` are all rejected with `ER_NON_SCALAR_USED_AS_KEY` (6134),
 because a vector is not a scalar the server can order.
 
-A workload that needs an approximate index today keeps the vectors in an InnoDB table beside the
-TidesDB one. The suite carries a test that fails if a TidesDB table ever accepts a vector index, so
-the change is noticed rather than missed.
+The suite carries a test that fails the day a server accepts a vector index on a TidesDB table, so
+that change is noticed rather than missed.
 
 ## What that costs
 

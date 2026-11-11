@@ -19,10 +19,9 @@ not parse.
 
 **Vector indexes.** On 9.7 a `VECTOR` column stores and reads back, because the server models the
 type as a blob and the engine stores blobs — there is no vector-specific code in TideSQL or in the
-TidesDB library. Percona Server 9.7 adds an approximate nearest-neighbour index that an engine has
-to declare and build itself; InnoDB does, TideSQL does not, so a `VECTOR KEY` on a TidesDB table is
-refused with `ER_TABLE_CANT_HANDLE_INDEX` (7035). A similarity query still works, ranked by the
-server's `DISTANCE` function over a full scan. See [Vector Columns](/reference/vector-columns).
+TidesDB library. Percona Server 9.7.2 has no vector index for any engine, so there is nothing to
+index the column with; a similarity query still works, ranked by the server's `DISTANCE` function
+over a full scan. See [Vector Columns](/reference/vector-columns).
 
 **Multi-primary clustering.** The server carries no write-set replication integration, so there is
 nothing for the engine to participate in. Source-and-replica topologies work normally. See

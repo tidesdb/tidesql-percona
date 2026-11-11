@@ -700,10 +700,13 @@ prepare_percona() {
 add_server_cmake_args() {
     # The server's own unit tests are not what this script builds for and roughly double the
     # build.  Percona's cmake would otherwise take the distribution's packaging flags on Debian
-    # and RHEL, which add link time optimization the plugin is not built for.
+    # and RHEL, which add link time optimization the plugin is not built for.  8.0 links the
+    # system readline unless told otherwise; the bundled editline is the 8.4 and later default
+    # and needs no readline headers on the host.
     cmake_args+=(
         -DWITH_UNIT_TESTS=OFF
         -DWITH_PACKAGE_FLAGS=OFF
+        -DWITH_EDITLINE=bundled
     )
 
     # Boost ships in the server tree from 8.4 on.  8.0 names an exact Boost release instead and
